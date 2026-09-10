@@ -85,6 +85,7 @@
   }
   .dot.live{ background: var(--accent-2); box-shadow: 0 0 6px var(--accent-2); }
   .dot.busy{ background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+  .dot.err{ background: var(--danger); box-shadow: 0 0 6px var(--danger); }
 
   .layout{
     display: grid;
@@ -335,7 +336,7 @@
         <div class="brand-mark"></div>
         <h1>Sync Deck</h1>
       </div>
-      <div class="sub">Control your queue from wherever you're sitting</div>
+      <div class="sub">Control the shared queue from wherever you're sitting</div>
     </div>
     <div class="status-pill">
       <div class="dot" id="statusDot"></div>
@@ -355,7 +356,7 @@
         <button class="btn btn-add" id="addBtn">Add</button>
       </div>
       <div class="queue-list" id="queueList">
-        <div class="queue-empty">Your queue is empty.<br>Paste a link above to add something.</div>
+        <div class="queue-empty">Queue is empty.<br>Paste a link above to add something.</div>
       </div>
     </div>
 
@@ -391,7 +392,7 @@
   </div>
 
   <div class="footer-note">
-    <b>How this works:</b> open this same page on your phone and your PC while signed into the same Claude account. Whatever you queue up or press on one device shows up on the other within a couple seconds — no app, no cable.
+    <b>How this works:</b> this page talks to a server you run (see README.md). Anyone who opens the same URL — on your phone, or anywhere in the world — shares the same queue and playback state in real time.
   </div>
 
 </div>
@@ -399,7 +400,6 @@
 <script src="https://www.youtube.com/iframe_api"></script>
 <script>
 (function(){
-  const STORAGE_KEY = 'sync-deck-state';
   const DEVICE_ID = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random())).slice(0,8);
 
   let state = { queue: [], currentIndex: -1, isPlaying: false, position: 0, ts: 0, device: null };
@@ -409,6 +409,9 @@
   let applyingRemote = false;
   let pendingLoad = null;
   let scrubbing = false;
+  let ws = null;
+  let wsReady = false;
+  let reconnectDelay = 1000;
 
   const el = {
     statusDot: document.getElementById('statusDot'),
@@ -474,7 +477,7 @@
   function renderQueue(){
     el.queueCount.textContent = state.queue.length;
     if(state.queue.length === 0){
-      el.queueList.innerHTML = '<div class="queue-empty">Your queue is empty.<br>Paste a link above to add something.</div>';
+      el.queueList.innerHTML = '<div class="queue-empty">Queue is empty.<br>Paste a link above to add something.</div>';
       return;
     }
     el.queueList.innerHTML = '';
@@ -511,10 +514,13 @@
     el.playIcon.innerHTML = state.isPlaying ? ICON_PAUSE : ICON_PLAY;
   }
 
+  // Send our local state to the server, which timestamps it and rebroadcasts
+  // it to every connected client (including us, for confirmation).
   function persist(partial){
-    state = Object.assign({}, state, partial, { ts: Date.now(), device: DEVICE_ID });
-    lastAppliedTs = state.ts;
-    window.storage.set(STORAGE_KEY, JSON.stringify(state)).catch(()=>{});
+    state = Object.assign({}, state, partial, { device: DEVICE_ID });
+    if(wsReady){
+      ws.send(JSON.stringify({ type: 'update', state }));
+    }
   }
 
   function playIndex(i, broadcast){
@@ -605,7 +611,7 @@
     }
   }
 
-  // ---- Remote sync ----
+  // ---- Remote sync (WebSocket) ----
   function applyRemoteState(remote){
     applyingRemote = true;
     const queueChanged = JSON.stringify(remote.queue) !== JSON.stringify(state.queue);
@@ -632,36 +638,43 @@
     setTimeout(() => { applyingRemote = false; }, 400);
   }
 
-  async function pollStorage(){
-    try{
-      const res = await window.storage.get(STORAGE_KEY);
-      if(res && res.value){
-        const remote = JSON.parse(res.value);
-        if(remote.ts > lastAppliedTs && remote.device !== DEVICE_ID){
-          lastAppliedTs = remote.ts;
-          applyRemoteState(remote);
-        }
-        setStatus('live', 'synced');
-      }
-    }catch(e){
-      setStatus(null, 'waiting for first sync');
-    }
-  }
+  function connectWS(){
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(proto + '//' + location.host + '/ws');
 
-  async function initState(){
-    try{
-      const res = await window.storage.get(STORAGE_KEY);
-      if(res && res.value){
-        state = JSON.parse(res.value);
-        lastAppliedTs = state.ts || 0;
+    ws.onopen = () => {
+      wsReady = true;
+      reconnectDelay = 1000;
+      setStatus('live', 'synced');
+    };
+
+    ws.onmessage = (evt) => {
+      let msg;
+      try { msg = JSON.parse(evt.data); } catch(e){ return; }
+      if(msg.type === 'state' && msg.state){
+        const remote = msg.state;
+        if(remote.ts > lastAppliedTs){
+          lastAppliedTs = remote.ts;
+          if(remote.device !== DEVICE_ID){
+            applyRemoteState(remote);
+          } else {
+            // our own update, confirmed by the server - just adopt the ts
+            state = Object.assign({}, state, { ts: remote.ts });
+          }
+        }
       }
-    }catch(e){ /* nothing stored yet */ }
-    renderQueue();
-    renderNowPlaying();
-    setStatus('live', state.queue.length ? 'synced' : 'ready');
-    if(state.currentIndex >= 0 && state.queue[state.currentIndex]){
-      loadAndPlay(state.queue[state.currentIndex].videoId, state.position || 0, false);
-    }
+    };
+
+    ws.onclose = () => {
+      wsReady = false;
+      setStatus('err', 'reconnecting…');
+      setTimeout(connectWS, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 1.5, 10000);
+    };
+
+    ws.onerror = () => {
+      ws.close();
+    };
   }
 
   // ---- YouTube player ----
@@ -733,8 +746,10 @@
     }
   }, 5000);
 
-  setInterval(pollStorage, 1500);
-  initState();
+  setStatus(null, 'connecting…');
+  connectWS();
+  renderQueue();
+  renderNowPlaying();
 })();
 </script>
 </body>
