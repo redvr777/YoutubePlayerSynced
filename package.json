@@ -1,0 +1,13 @@
+{
+  "name": "sync-deck-server",
+  "version": "1.0.0",
+  "description": "Self-hosted synced YouTube queue/player - anyone with the link can add songs and control playback in real time.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  }
+}
